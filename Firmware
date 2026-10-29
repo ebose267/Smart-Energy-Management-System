@@ -1,0 +1,1079 @@
+/*
+ * ============================================================================
+ *  SMART ENERGY MANAGEMENT SYSTEM  (ESP32 + PZEM-004T v3 + ST7735 + relay)
+ * ============================================================================
+ *  Libraries (Library Manager):
+ *    - PZEM004Tv30            (Jakub Mandula)
+ *    - Adafruit GFX Library
+ *    - Adafruit ST7735 and ST7789 Library
+ *  Built in to the ESP32 core: WiFi, WebServer, ESPmDNS, Preferences.
+ *  (ArduinoJson and EEPROM are no longer needed.)
+ *
+ *  WIRING NOTES
+ *    PZEM TX -> ESP32 GPIO16 (RX2)     PZEM RX -> ESP32 GPIO17 (TX2)
+ *    The PZEM voltage tap and CT clamp MUST be on the SUPPLY side of the
+ *    relay. Otherwise the PZEM reads 0 V when the relay is open, so the
+ *    meter can never see the grid come back and theft detection can't work.
+ *    TFT uses hardware SPI: SCK=18, MOSI=23, CS=5, DC=21, RST=22.
+ *
+ *  FIRST LOGIN:  user "admin", password "admin123"  (change it in Settings!)
+ * ============================================================================
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <PZEM004Tv30.h>
+#include <time.h>
+
+// ============================== PINS ========================================
+#define PZEM_RX_PIN   16
+#define PZEM_TX_PIN   17
+#define TFT_CS        5
+#define TFT_DC        21
+#define TFT_RST       22
+#define RELAY_PIN     4
+#define BUTTON_PIN    32
+#define RELAY_ACTIVE_LOW true      // true: LOW energises the relay coil
+
+// ============================== NETWORK =====================================
+const char* WIFI_SSID = "REDMI15C";
+const char* WIFI_PASS = "12345678";
+const char* AP_SSID   = "SmartEnergy-Setup";   // fallback hotspot if router is unreachable
+const char* AP_PASS   = "meter1234";          // at least 8 chars
+const char* HOSTNAME  = "smartenergy";         // http://smartenergy.local
+const char* ADMIN_USER = "admin";
+#define DEFAULT_PASSWORD "admin123"
+
+// ============================== NIGERIA DEFAULTS ============================
+// 230 V / 50 Hz grid. Tariff is an editable default: set YOUR DisCo band rate
+// in Settings (check your DisCo's current NERC tariff).
+#define DEF_TARIFF        209.5f   // NGN per kWh
+#define DEF_OVER_V        253.0f   // +10% of 230 V
+#define DEF_UNDER_V       190.0f
+#define DEF_OVER_I        10.0f    // set to your breaker / PZEM range
+#define DEF_THEFT_I       0.05f    // current with relay OPEN that counts as bypass
+#define DEF_MIN_BAL       0.0f     // NGN, relay cuts at or below this
+#define DEF_LOW_BAL       200.0f   // NGN, low credit warning
+#define DEF_RESTORE_SEC   30.0f    // wait after grid returns before closing relay
+#define MIN_RECHARGE      100.0f
+#define MAX_RECHARGE      500000.0f
+
+// ============================== TIMING / LIMITS =============================
+const unsigned long READ_INTERVAL      = 2000;
+const unsigned long DISPLAY_INTERVAL   = 1000;
+const unsigned long FAULT_COOLDOWN     = 30000;   // overload must stay clear this long
+const unsigned long MIN_SWITCH_MS      = 5000;    // relay contact protection
+const unsigned long SENSOR_CUTOFF_MS   = 60000;   // cut power if meter blind this long
+const unsigned long REMINDER_INTERVAL  = 600000;  // 10 min
+const unsigned long SESSION_MS         = 1800000; // 30 min idle logout
+const unsigned long LONG_PRESS_MS      = 2000;
+const unsigned long DEBOUNCE_MS        = 40;
+const unsigned long WIFI_BOOT_TIMEOUT  = 15000;
+const float         MIN_GRID_V         = 100.0f;  // below this = no grid (NEPA took light)
+#define TX_MAX 10
+
+// ============================== COLOURS =====================================
+#define C_BLACK  0x0000
+#define C_BLUE   0x001F
+#define C_RED    0xF800
+#define C_GREEN  0x07E0
+#define C_YELLOW 0xFFE0
+#define C_WHITE  0xFFFF
+#define C_DARK   0x2104
+#define C_GRAY   0x8410
+#define C_CYAN   0x07FF
+#define C_ORANGE 0xFD20
+
+// ============================== OBJECTS =====================================
+WebServer   server(80);
+Preferences prefs;
+Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_RST);          // hardware SPI
+PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
+
+// ============================== STATE =======================================
+struct Readings { float v, i, p, e, f, pf; bool eValid; };
+Readings readings = {0, 0, 0, 0, 0, 0, false};
+
+bool   firstRead = false, sensorFailed = false;
+uint8_t sensorFails = 0;
+unsigned long sensorFailSince = 0;
+
+double balance = 0.0;           // NGN
+float  lastEnergy = -1.0f;      // PZEM kWh counter at last billing (-1 = not set)
+float  todayKwh = 0.0f;
+int    lastYday = -1;
+double savedBalance = -1.0;
+unsigned long lastSave = 0;
+bool   dirty = false;
+
+float overV = DEF_OVER_V, underV = DEF_UNDER_V, overI = DEF_OVER_I, theftI = DEF_THEFT_I;
+float minBalance = DEF_MIN_BAL, lowBal = DEF_LOW_BAL, tariff = DEF_TARIFF, restoreSec = DEF_RESTORE_SEC;
+
+bool relayState = false;        // actual relay position (boots OFF)
+bool manualOff = false;         // owner forced OFF (persisted)
+unsigned long lastSwitch = 0;
+
+bool gridPresent = false;
+uint8_t badCnt = 0;
+unsigned long supplyStableSince = 0;
+bool voltFault = false; const char* voltReason = "";
+bool currentFault = false, faultLatched = false;
+uint8_t ocCnt = 0, tripCount = 0;
+unsigned long faultTime = 0, lastTripTime = 0;
+bool theftDetected = false; uint8_t tCnt = 0, tClr = 0;
+bool lowNotified = false;
+
+String adminPw = DEFAULT_PASSWORD;
+String sessionToken = "";
+unsigned long lastActivity = 0, lockUntil = 0;
+uint8_t failCount = 0;
+
+struct Tx { uint32_t t; float a; };
+Tx txLog[TX_MAX];
+
+// Wi-Fi
+bool apActive = false, mdnsStarted = false;
+String ipStr = ""; bool ipIsAp = false;
+unsigned long lastConnectedMs = 0;
+
+// Display
+int  displayPage = 0;
+bool layoutDrawn = false, uiReady = false;
+char notifMsg[28] = ""; uint16_t notifColor = C_WHITE; unsigned long notifEnd = 0; bool notifActive = false;
+char cellCache[6][16];
+char limCache[9][16];
+int  lastWifiDot = -1;
+
+enum StatusId { S_START, S_SENSOR, S_NOGRID, S_FAULT, S_THEFT, S_MANUAL, S_NOCREDIT, S_RESTORE, S_LOW, S_ACTIVE };
+const char* STATUS_NAME[]  = {"STARTING","SENSOR ERR","NO GRID","FAULT","THEFT","MANUAL OFF","NO CREDIT","RESTORING","LOW CREDIT","ACTIVE"};
+const uint16_t STATUS_COLOR[] = {C_GRAY, C_RED, C_ORANGE, C_RED, C_ORANGE, C_GRAY, C_RED, C_YELLOW, C_YELLOW, C_GREEN};
+
+// ============================== PROTOTYPES ==================================
+void notify(const char* msg, uint16_t color, unsigned long dur = 5000);
+void evaluateRelay();
+void maybeSave(bool force);
+
+// ============================== WEB PAGES ===================================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Energy Management System</title>
+<style>
+:root{--g:#008751;--bg:#f1f5f2;--c:#fff;--t:#1d2a22;--m:#6b7a70;--r:#d64045;--y:#c98f00;--br:#dbe4de}
+@media(prefers-color-scheme:dark){:root{--bg:#101612;--c:#19211c;--t:#e8f0ea;--m:#93a398;--br:#2a362e}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--t);line-height:1.5}
+header{background:var(--g);color:#fff;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+header a{color:#fff;font-size:14px;margin-left:10px}
+nav{display:flex;background:var(--c);border-bottom:1px solid var(--br);position:sticky;top:0;z-index:5}
+nav a{flex:1;text-align:center;padding:12px 6px;cursor:pointer;color:var(--m);font-weight:600;border-bottom:3px solid transparent}
+nav a.on{color:var(--g);border-bottom-color:var(--g)}
+main{max-width:900px;margin:0 auto;padding:14px}
+.tab{display:none}.tab.on{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px}
+.card{background:var(--c);border:1px solid var(--br);border-radius:12px;padding:14px;margin-bottom:14px}
+.grid .card{margin-bottom:0}
+.card h4{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--m);margin-bottom:6px}
+.val{font-size:26px;font-weight:700}
+.big .val{font-size:32px;color:var(--g)}
+small{color:var(--m);display:block}
+.chip{display:inline-block;padding:3px 10px;border-radius:99px;font-size:13px;font-weight:700;background:var(--br);color:var(--t)}
+.chip.ok{background:#d4f1e0;color:#0a6b3a}.chip.warn{background:#fff0c2;color:#7a5600}.chip.bad{background:#fbd9da;color:#9b1c22}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.btn{border:0;border-radius:8px;padding:11px 16px;font-size:15px;font-weight:700;color:#fff;cursor:pointer;flex:1;min-width:110px}
+.btn.g{background:var(--g)}.btn.r{background:var(--r)}.btn.n{background:#3b5b8f}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+input{width:100%;padding:10px;border:1px solid var(--br);border-radius:8px;font-size:16px;background:var(--bg);color:var(--t)}
+label{display:block;font-size:13px;color:var(--m);margin:10px 0 4px}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px}
+.quick{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.quick button{flex:1;min-width:70px;padding:9px;border:1px solid var(--br);border-radius:8px;background:var(--bg);color:var(--t);font-weight:600;cursor:pointer}
+.banner{padding:10px 14px;border-radius:8px;margin-bottom:14px;background:#fff0c2;color:#7a5600;font-size:14px}
+table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px 4px;border-bottom:1px solid var(--br);text-align:left}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#222;color:#fff;padding:10px 18px;border-radius:8px;display:none;z-index:9;max-width:90%}
+#toast.bad{background:var(--r)}#toast.ok{background:var(--g)}
+</style></head><body>
+<header><b>&#9889; Smart Energy Management System</b>
+<div><span id="conn" class="chip">...</span><a href="/logout">Logout</a></div></header>
+<nav><a data-t="dash" class="on" onclick="show('dash')">Dashboard</a>
+<a data-t="recharge" onclick="show('recharge')">Recharge</a>
+<a data-t="settings" onclick="show('settings')">Settings</a></nav>
+<main>
+<div id="banner" class="banner" style="display:none"></div>
+
+<section id="t-dash" class="tab on">
+ <div class="grid">
+  <div class="card big"><h4>Balance</h4><div class="val" id="bal">--</div><small id="units">--</small></div>
+  <div class="card"><h4>Status</h4><span id="st" class="chip">--</span><small id="note" style="margin-top:6px"></small></div>
+  <div class="card"><h4>Voltage</h4><div class="val" id="v">--</div></div>
+  <div class="card"><h4>Current</h4><div class="val" id="i">--</div></div>
+  <div class="card"><h4>Power</h4><div class="val" id="p">--</div></div>
+  <div class="card"><h4>Frequency / PF</h4><div class="val" style="font-size:20px" id="fpf">--</div></div>
+  <div class="card"><h4>Used today</h4><div class="val" style="font-size:20px" id="today">--</div></div>
+  <div class="card"><h4>Meter total</h4><div class="val" style="font-size:20px" id="tot">--</div></div>
+  <div class="card"><h4>Time left at this load</h4><div class="val" style="font-size:20px" id="hrs">--</div></div>
+ </div>
+ <div class="card"><h4>Power supply</h4>
+  <p style="margin-bottom:10px">Relay is <b id="relay">--</b></p>
+  <div class="row"><button id="onBtn" class="btn g" onclick="setRelay(1)">Power ON</button>
+  <button id="offBtn" class="btn r" onclick="setRelay(0)">Power OFF</button></div>
+  <small id="flags" style="margin-top:10px"></small>
+ </div>
+</section>
+
+<section id="t-recharge" class="tab">
+ <div class="card"><h4>Recharge account</h4>
+  <label for="amt">Amount (&#8358;)</label>
+  <input type="number" id="amt" value="1000" min="100" step="50" inputmode="decimal">
+  <div class="quick">
+   <button onclick="setAmt(500)">&#8358;500</button><button onclick="setAmt(1000)">&#8358;1,000</button>
+   <button onclick="setAmt(2000)">&#8358;2,000</button><button onclick="setAmt(5000)">&#8358;5,000</button>
+  </div>
+  <button class="btn g" style="width:100%" id="rcBtn" onclick="recharge()">Recharge now</button>
+  <small id="rcInfo" style="margin-top:8px"></small>
+ </div>
+ <div class="card"><h4>Last recharges</h4>
+  <table><thead><tr><th>Date</th><th>Amount</th></tr></thead><tbody id="hist"><tr><td colspan="2">Loading...</td></tr></tbody></table>
+ </div>
+</section>
+
+<section id="t-settings" class="tab">
+ <div class="card"><h4>Billing</h4><div class="two">
+  <div><label>Tariff (&#8358; per kWh)</label><input type="number" id="tariff" step="0.01"></div>
+  <div><label>Cut-off balance (&#8358;)</label><input type="number" id="minBal" step="1"></div>
+  <div><label>Low credit warning (&#8358;)</label><input type="number" id="lowBal" step="10"></div>
+ </div></div>
+ <div class="card"><h4>Protection</h4><div class="two">
+  <div><label>Over-voltage cut (V)</label><input type="number" id="overV" step="1"></div>
+  <div><label>Under-voltage cut (V)</label><input type="number" id="underV" step="1"></div>
+  <div><label>Overload cut (A)</label><input type="number" id="overI" step="0.1"></div>
+  <div><label>Theft current, relay OFF (A)</label><input type="number" id="theftI" step="0.005"></div>
+  <div><label>Restore delay after grid returns (s)</label><input type="number" id="rdelay" step="1"></div>
+ </div>
+ <button class="btn n" style="width:100%;margin-top:14px" onclick="saveSettings()">Save settings</button></div>
+ <div class="card"><h4>Admin password</h4><div class="two">
+  <div><label>Current password</label><input type="password" id="oldPw" autocomplete="current-password"></div>
+  <div><label>New password (min 6 characters)</label><input type="password" id="newPw" autocomplete="new-password"></div>
+ </div><button class="btn n" style="width:100%;margin-top:14px" onclick="changePw()">Change password</button></div>
+ <div class="card"><h4 style="color:var(--r)">Factory reset</h4>
+  <p style="margin:6px 0 12px;font-size:14px">Erases balance, history and all settings. Cannot be undone.</p>
+  <button class="btn r" style="width:100%" onclick="factoryReset()">Factory reset</button></div>
+</section>
+</main>
+<div id="toast"></div>
+<script>
+const $=id=>document.getElementById(id), N='\u20A6';
+const fmt=(x,d=2)=>Number(x).toLocaleString('en-NG',{minimumFractionDigits:d,maximumFractionDigits:d});
+const STC={'ACTIVE':'ok','LOW CREDIT':'warn','RESTORING':'warn','NO GRID':'warn','NO CREDIT':'bad','FAULT':'bad','THEFT':'bad','SENSOR ERR':'bad'};
+const SET=['tariff','minBal','lowBal','overV','underV','overI','theftI','rdelay'];
+let last=null,tt;
+function toast(m,ok){const t=$('toast');t.textContent=m;t.className=ok?'ok':'bad';t.style.display='block';clearTimeout(tt);tt=setTimeout(()=>t.style.display='none',4000);}
+async function api(p,o){const r=await fetch(p,o);if(r.status===401){location.href='/login';throw new Error('auth');}return r.json();}
+function post(p,obj){return api(p,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(obj)});}
+function show(t){
+  document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('on',e.id==='t-'+t));
+  document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on',a.dataset.t===t));
+  if(t==='recharge')loadHist(); if(t==='settings')fillSettings();
+}
+function fillSettings(){if(!last)return;SET.forEach(k=>{$(k).value=last[k];});}
+function setAmt(a){$('amt').value=a;}
+function render(d){
+  $('bal').textContent=N+fmt(d.bal);
+  $('units').textContent=fmt(d.units,2)+' units (kWh) left';
+  $('v').textContent=fmt(d.v,1)+' V'; $('i').textContent=fmt(d.i,3)+' A'; $('p').textContent=fmt(d.p,1)+' W';
+  $('fpf').textContent=fmt(d.f,1)+' Hz / '+fmt(d.pf,2);
+  $('today').textContent=d.todayOk?fmt(d.today,3)+' kWh ('+N+fmt(d.todayN)+')':'Waiting for time sync';
+  $('tot').textContent=fmt(d.e,3)+' kWh';
+  $('hrs').textContent=d.hrs>=0?(d.hrs>=48?fmt(d.hrs/24,1)+' days':fmt(d.hrs,1)+' hrs'):'No load';
+  const s=$('st');s.textContent=d.st;s.className='chip '+(STC[d.st]||'');
+  $('relay').textContent=d.relay?'ON':'OFF';
+  $('onBtn').disabled=d.relay; $('offBtn').disabled=d.manual;
+  let n='';
+  if(d.restore>0)n='Power returns in '+d.restore+'s';
+  else if(d.fault)n=d.fault;
+  else if(d.st==='NO GRID')n='No grid supply (NEPA off)';
+  $('note').textContent=n;
+  $('flags').textContent=d.theft?'\u26A0 Current is flowing while power is OFF: possible bypass or theft.':'';
+  const b=$('banner');let msg='';
+  if(d.defpw)msg='Security: change the default admin password in Settings.';
+  else if(d.ap)msg='Meter is in setup hotspot mode (router not found).';
+  b.style.display=msg?'block':'none';b.textContent=msg;
+}
+async function poll(){
+  try{last=await api('/data');render(last);const c=$('conn');c.textContent='Live';c.className='chip ok';}
+  catch(e){const c=$('conn');c.textContent='Offline';c.className='chip bad';}
+}
+async function setRelay(on){
+  try{const d=await post('/setRelay',{state:on});toast(d.message,d.success);poll();}catch(e){}
+}
+async function recharge(){
+  const b=$('rcBtn');b.disabled=true;
+  try{const d=await post('/recharge',{amount:$('amt').value});toast(d.message,d.success);if(d.success){poll();loadHist();}}catch(e){}
+  b.disabled=false;
+}
+async function loadHist(){
+  try{const h=await api('/history');const tb=$('hist');
+   if(!h.length){tb.innerHTML='<tr><td colspan="2">No recharges yet</td></tr>';return;}
+   tb.innerHTML=h.map(x=>'<tr><td>'+(x.t>0?new Date(x.t*1000).toLocaleString('en-NG'):'(time unknown)')+'</td><td>'+N+fmt(x.a)+'</td></tr>').join('');
+  }catch(e){}
+}
+async function saveSettings(){
+  const o={};SET.forEach(k=>o[k]=$(k).value);
+  try{const d=await post('/settings',o);toast(d.message,d.success);if(d.success)poll();}catch(e){}
+}
+async function changePw(){
+  try{const d=await post('/password',{oldPw:$('oldPw').value,newPw:$('newPw').value});toast(d.message,d.success);
+   if(d.success){$('oldPw').value='';$('newPw').value='';poll();}}catch(e){}
+}
+async function factoryReset(){
+  if(!confirm('This erases ALL credit, history and settings. Continue?'))return;
+  const pw=prompt('Enter admin password to confirm');if(!pw)return;
+  try{const d=await post('/factoryReset',{pw:pw});toast(d.message,d.success);
+   if(d.success)setTimeout(()=>location.href='/login',5000);}catch(e){}
+}
+poll();setInterval(poll,3000);
+</script></body></html>)rawliteral";
+
+const char LOGIN_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login - Smart Energy Management System</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#f1f5f2;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:16px}
+@media(prefers-color-scheme:dark){body{background:#101612;color:#e8f0ea}.box{background:#19211c!important}input{background:#101612!important;color:#e8f0ea!important;border-color:#2a362e!important}}
+.box{background:#fff;width:100%;max-width:360px;padding:28px;border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.12)}
+.bar{display:flex;height:6px;border-radius:3px;overflow:hidden;margin-bottom:18px}.bar i{flex:1;background:#008751}.bar i:nth-child(2){background:#fff;border-block:1px solid #ddd}
+h2{margin:0 0 18px;text-align:center}
+label{display:block;font-size:13px;margin:12px 0 4px;color:#6b7a70}
+input{width:100%;padding:11px;border:1px solid #cfd8d2;border-radius:8px;font-size:16px}
+button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;background:#008751;color:#fff;font-size:16px;font-weight:700;cursor:pointer}
+.err{display:none;background:#fbd9da;color:#9b1c22;padding:10px;border-radius:8px;font-size:14px;margin-bottom:6px}
+</style></head><body><div class="box">
+<div class="bar"><i></i><i></i><i></i></div>
+<h2>&#9889; Smart Energy Management System</h2>
+<div id="err" class="err"></div>
+<form method="post" action="/login">
+<label for="u">Username</label><input id="u" name="username" autocomplete="username" required>
+<label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">Login</button></form></div>
+<script>
+const q=new URLSearchParams(location.search),e=document.getElementById('err');
+if(q.has('error')){e.style.display='block';e.textContent='Invalid username or password';}
+if(q.has('locked')){e.style.display='block';e.textContent='Too many attempts. Wait 60 seconds.';}
+</script></body></html>)rawliteral";
+
+// ============================== HELPERS =====================================
+float finiteOr0(float x) { return isfinite(x) ? x : 0.0f; }
+bool timeValid() { return time(nullptr) > 1700000000; }
+
+const char* validateLimits(float oV, float uV, float oI, float tI, float mB, float lB, float tar, float rdl) {
+  if (!(oV >= 200 && oV <= 260))    return "Over-voltage must be 200-260 V";
+  if (!(uV >= 100 && uV <= 220))    return "Under-voltage must be 100-220 V";
+  if (uV >= oV)                     return "Under-voltage must be below over-voltage";
+  if (!(oI >= 1 && oI <= 100))      return "Overload must be 1-100 A";
+  if (!(tI >= 0.005f && tI <= 1))   return "Theft current must be 0.005-1 A";
+  if (!(mB >= 0 && mB <= 10000))    return "Cut-off balance must be 0-10000";
+  if (!(lB >= 0 && lB <= 100000))   return "Low credit must be 0-100000";
+  if (!(tar >= 1 && tar <= 5000))   return "Tariff must be 1-5000 per kWh";
+  if (!(rdl >= 5 && rdl <= 900))    return "Restore delay must be 5-900 s";
+  return NULL;
+}
+
+// ============================== STORAGE =====================================
+void saveSettings() {
+  prefs.putFloat("overV", overV);   prefs.putFloat("underV", underV);
+  prefs.putFloat("overI", overI);   prefs.putFloat("theftI", theftI);
+  prefs.putFloat("minBal", minBalance); prefs.putFloat("lowBal", lowBal);
+  prefs.putFloat("tariff", tariff); prefs.putFloat("rdelay", restoreSec);
+}
+
+void loadSettings() {
+  overV = prefs.getFloat("overV", DEF_OVER_V);   underV = prefs.getFloat("underV", DEF_UNDER_V);
+  overI = prefs.getFloat("overI", DEF_OVER_I);   theftI = prefs.getFloat("theftI", DEF_THEFT_I);
+  minBalance = prefs.getFloat("minBal", DEF_MIN_BAL); lowBal = prefs.getFloat("lowBal", DEF_LOW_BAL);
+  tariff = prefs.getFloat("tariff", DEF_TARIFF); restoreSec = prefs.getFloat("rdelay", DEF_RESTORE_SEC);
+  if (validateLimits(overV, underV, overI, theftI, minBalance, lowBal, tariff, restoreSec)) {
+    overV = DEF_OVER_V; underV = DEF_UNDER_V; overI = DEF_OVER_I; theftI = DEF_THEFT_I;
+    minBalance = DEF_MIN_BAL; lowBal = DEF_LOW_BAL; tariff = DEF_TARIFF; restoreSec = DEF_RESTORE_SEC;
+    saveSettings();
+  }
+  balance = prefs.getDouble("bal", 0.0);
+  if (!isfinite(balance) || balance < 0) balance = 0;
+  lastEnergy = prefs.getFloat("lastE", -1.0f);
+  if (!isfinite(lastEnergy)) lastEnergy = -1.0f;
+  todayKwh = prefs.getFloat("today", 0.0f);
+  if (!isfinite(todayKwh) || todayKwh < 0) todayKwh = 0;
+  lastYday = prefs.getInt("yday", -1);
+  manualOff = prefs.getBool("mOff", false);
+  adminPw = prefs.getString("pw", DEFAULT_PASSWORD);
+  memset(txLog, 0, sizeof(txLog));
+  if (prefs.getBytesLength("txlog") == sizeof(txLog)) prefs.getBytes("txlog", txLog, sizeof(txLog));
+  savedBalance = balance;
+}
+
+// Balance and lastEnergy are always saved together, so after a power cut the
+// meter simply re-bills the energy since the last save: nothing is lost or doubled.
+void maybeSave(bool force) {
+  unsigned long now = millis();
+  bool need = force || fabs(balance - savedBalance) >= 0.5 ||
+              (balance <= 0 && savedBalance > 0) || (dirty && now - lastSave > 600000UL);
+  if (!need) return;
+  prefs.putDouble("bal", balance);
+  prefs.putFloat("lastE", lastEnergy);
+  prefs.putFloat("today", todayKwh);
+  prefs.putInt("yday", lastYday);
+  savedBalance = balance; lastSave = now; dirty = false;
+}
+
+void addTx(float amount) {
+  memmove(&txLog[1], &txLog[0], sizeof(Tx) * (TX_MAX - 1));
+  txLog[0].t = timeValid() ? (uint32_t)time(nullptr) : 0;
+  txLog[0].a = amount;
+  prefs.putBytes("txlog", txLog, sizeof(txLog));
+}
+
+// ============================== RELAY =======================================
+void driveRelay(bool on) {
+  digitalWrite(RELAY_PIN, (on != RELAY_ACTIVE_LOW) ? HIGH : LOW);
+}
+
+void setRelay(bool on, const char* msg) {
+  relayState = on;
+  driveRelay(on);
+  lastSwitch = millis();
+  notify(msg, on ? C_GREEN : C_RED);
+  Serial.printf("[Relay] %s (%s)\n", on ? "ON" : "OFF", msg);
+}
+
+bool supplyReady() {
+  return supplyStableSince != 0 && (millis() - supplyStableSince) >= (unsigned long)(restoreSec * 1000.0f);
+}
+
+const char* offReason() {
+  if (manualOff)                 return "Manually switched off";
+  if (sensorFailed)              return "Meter sensor error";
+  if (balance <= minBalance)     return "Insufficient credit";
+  if (currentFault)              return "Overload fault active";
+  if (!gridPresent)              return "No grid supply";
+  if (!supplyReady())            return "Waiting for supply to stabilise";
+  return NULL;
+}
+
+void evaluateRelay() {
+  unsigned long now = millis();
+  bool want;
+  if (manualOff) want = false;
+  else if (sensorFailed) want = relayState && !(now - sensorFailSince >= SENSOR_CUTOFF_MS);
+  else want = (balance > minBalance) && !currentFault && supplyReady();
+
+  if (want == relayState) return;
+  if (!want) {
+    const char* why = offReason();
+    if (!why) why = "Meter fault cut-off";
+    if (!sensorFailed && !gridPresent && !manualOff) why = "No grid supply";
+    setRelay(false, why);
+  } else if (now - lastSwitch >= MIN_SWITCH_MS) {
+    setRelay(true, "Power ON");
+  }
+}
+
+void clearFaultLatch() { faultLatched = false; currentFault = false; ocCnt = 0; tripCount = 0; }
+
+// Shared by the web UI and the push button.
+void userPower(bool on) {
+  if (on) { manualOff = false; clearFaultLatch(); }
+  else    { manualOff = true; }
+  prefs.putBool("mOff", manualOff);
+  evaluateRelay();
+}
+
+// ============================== METERING ====================================
+void readPzem() {
+  float v = pzem.voltage();
+  if (isnan(v)) {
+    if (sensorFails < 255) sensorFails++;
+    if (sensorFails == 3) {
+      sensorFailed = true; sensorFailSince = millis();
+      readings.v = readings.i = readings.p = readings.f = readings.pf = 0;
+      notify("PZEM not responding", C_RED, 8000);
+    }
+    return;
+  }
+  if (sensorFailed) notify("PZEM reconnected", C_GREEN);
+  sensorFailed = false; sensorFails = 0; firstRead = true;
+  readings.v = v;
+  readings.i = finiteOr0(pzem.current());
+  readings.p = finiteOr0(pzem.power());
+  readings.f = finiteOr0(pzem.frequency());
+  readings.pf = finiteOr0(pzem.pf());
+  float e = pzem.energy();
+  readings.eValid = isfinite(e);
+  if (readings.eValid) readings.e = e;
+}
+
+void updateDay() {
+  if (!timeValid()) return;
+  time_t n = time(nullptr); struct tm t; localtime_r(&n, &t);
+  if (t.tm_yday != lastYday) { todayKwh = 0; lastYday = t.tm_yday; dirty = true; }
+}
+
+void billing() {
+  if (sensorFailed || !readings.eValid) return;
+  if (lastEnergy < 0) { lastEnergy = readings.e; dirty = true; return; }  // first ever reading: don't bill history
+  float d = readings.e - lastEnergy;
+  if (d < 0 || d > 5.0f) { lastEnergy = readings.e; dirty = true; return; } // PZEM counter reset or glitch
+  if (d <= 0) return;
+  balance -= (double)d * tariff;
+  if (balance < 0) balance = 0;
+  lastEnergy = readings.e;
+  if (timeValid()) todayKwh += d;
+  dirty = true;
+}
+
+void updateProtection() {
+  unsigned long now = millis();
+  gridPresent = !sensorFailed && readings.v >= MIN_GRID_V;
+  bool vOk = gridPresent && readings.v >= underV && readings.v <= overV;
+
+  if (!sensorFailed) {
+    badCnt = vOk ? 0 : (badCnt < 10 ? badCnt + 1 : 10);
+    if (badCnt >= 2) supplyStableSince = 0;
+    else if (vOk && supplyStableSince == 0) supplyStableSince = now;
+  }
+  bool newVF = gridPresent && !vOk && badCnt >= 2;
+  if (newVF != voltFault) {
+    voltFault = newVF;
+    if (voltFault) { voltReason = readings.v > overV ? "Over-voltage" : "Low voltage"; notify(voltReason, C_RED); }
+    else notify("Voltage normal", C_GREEN);
+  }
+
+  // Overload: 2 consecutive hits trips, 30 s cool-down, latches after 3 trips in 10 min
+  bool oc = !sensorFailed && readings.i > overI;
+  ocCnt = oc ? (ocCnt < 10 ? ocCnt + 1 : 10) : 0;
+  if (!currentFault && ocCnt >= 2) {
+    currentFault = true; faultTime = now;
+    if (now - lastTripTime > 600000UL) tripCount = 0;
+    tripCount++; lastTripTime = now;
+    if (tripCount >= 3) { faultLatched = true; notify("OVERLOAD LATCHED!", C_RED, 10000); }
+    else notify("OVERLOAD! Power cut", C_RED);
+  } else if (currentFault && !faultLatched && !oc && now - faultTime >= FAULT_COOLDOWN) {
+    currentFault = false; notify("Overload cleared", C_GREEN);
+  }
+
+  // Theft: current flowing while relay is open (needs CT on supply side)
+  bool tRaw = !relayState && !sensorFailed && (now - lastSwitch > 3000) && readings.i > theftI;
+  if (tRaw) { if (tCnt < 10) tCnt++; tClr = 0; } else { if (tClr < 10) tClr++; tCnt = 0; }
+  if (!theftDetected && tCnt >= 3) { theftDetected = true; notify("THEFT DETECTED!", C_RED, 10000); }
+  else if (theftDetected && tClr >= 3) { theftDetected = false; notify("Theft alert cleared", C_GREEN); }
+
+  // Low credit warning (once per drop)
+  if (balance > lowBal) lowNotified = false;
+  else if (!lowNotified && relayState && balance > minBalance) { notify("Low credit! Recharge", C_YELLOW, 8000); lowNotified = true; }
+}
+
+int statusId() {
+  if (sensorFailed)             return S_SENSOR;
+  if (!firstRead)               return S_START;
+  if (!gridPresent)             return S_NOGRID;
+  if (currentFault || voltFault) return S_FAULT;
+  if (theftDetected)            return S_THEFT;
+  if (manualOff)                return S_MANUAL;
+  if (balance <= minBalance)    return S_NOCREDIT;
+  if (!relayState)              return S_RESTORE;
+  if (balance <= lowBal)        return S_LOW;
+  return S_ACTIVE;
+}
+
+const char* faultText() {
+  if (currentFault) return faultLatched ? "Overload latched. Press Power ON to reset" : "Overload cut-off";
+  if (voltFault) return voltReason;
+  return "";
+}
+
+// ============================== DISPLAY =====================================
+const int HDR_H = 14, ROW_Y0 = 17, ROW_H = 30, ROW_STEP = 32, FOOT_Y = 114, FOOT_H = 14;
+
+void drawNaira(int x, int y, uint16_t fg, uint16_t bg) {   // GFX font has no naira glyph, so draw N + 2 bars
+  tft.drawChar(x, y, 'N', fg, bg, 1);
+  tft.drawFastHLine(x, y + 2, 5, fg);
+  tft.drawFastHLine(x, y + 5, 5, fg);
+}
+
+void invalidateCaches() { memset(cellCache, 0, sizeof(cellCache)); memset(limCache, 0, sizeof(limCache)); lastWifiDot = -1; }
+
+void drawFooter() {
+  tft.fillRect(0, FOOT_Y, 160, FOOT_H, C_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(2, FOOT_Y + 3);
+  if (notifActive) { tft.setTextColor(notifColor, C_BLACK); tft.print(notifMsg); }
+  else if (ipStr.length()) { tft.setTextColor(C_GREEN, C_BLACK); tft.print(ipIsAp ? "AP " : "IP "); tft.print(ipStr); }
+  else { tft.setTextColor(C_RED, C_BLACK); tft.print("No WiFi"); }
+}
+
+void notify(const char* msg, uint16_t color, unsigned long dur) {
+  strncpy(notifMsg, msg, sizeof(notifMsg) - 1); notifMsg[sizeof(notifMsg) - 1] = 0;
+  notifColor = color; notifEnd = millis() + dur; notifActive = true;
+  if (uiReady) drawFooter();
+}
+
+void drawHeader(const char* page) {
+  tft.fillRect(0, 0, 160, HDR_H, C_BLUE);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE, C_BLUE);
+  tft.setCursor(4, 3); tft.print("SMART ENERGY SYSTEM");
+  tft.setCursor(136, 3); tft.print(page);
+}
+
+void drawLayout() {
+  tft.fillScreen(C_BLACK);
+  invalidateCaches();
+  tft.setTextSize(1);
+  if (displayPage == 0) {
+    drawHeader("1/2");
+    const char* L[3][2] = {{"VOLTAGE", "CURRENT"}, {"POWER", "ENERGY"}, {"BALANCE", "STATUS"}};
+    for (int r = 0; r < 3; r++) {
+      int y = ROW_Y0 + r * ROW_STEP;
+      tft.fillRoundRect(2, y, 156, ROW_H, 3, C_DARK);
+      tft.drawRoundRect(2, y, 156, ROW_H, 3, C_GRAY);
+      tft.setTextColor(C_CYAN, C_DARK);
+      tft.setCursor(5, y + 4);  tft.print(L[r][0]);
+      tft.setCursor(85, y + 4); tft.print(L[r][1]);
+    }
+  } else {
+    drawHeader("2/2");
+    const char* L[9] = {"Tariff/kWh", "Units left", "Used today", "Freq / PF", "Over volt", "Under volt", "Overload", "Theft curr", "Cut-off bal"};
+    tft.setTextColor(C_CYAN, C_BLACK);
+    for (int i = 0; i < 9; i++) { tft.setCursor(4, 20 + i * 10); tft.print(L[i]); }
+  }
+  drawFooter();
+  layoutDrawn = true; uiReady = true;
+}
+
+void cell(int idx, int x, int y, const char* txt, uint16_t fg, int width) {
+  if (strcmp(cellCache[idx], txt) == 0) return;
+  strncpy(cellCache[idx], txt, 15); cellCache[idx][15] = 0;
+  char pad[24]; snprintf(pad, sizeof(pad), "%-*s", width, txt);
+  tft.setTextColor(fg, C_DARK); tft.setCursor(x, y); tft.print(pad);
+}
+
+void limit(int idx, const char* txt) {
+  if (strcmp(limCache[idx], txt) == 0) return;
+  strncpy(limCache[idx], txt, 15); limCache[idx][15] = 0;
+  char pad[24]; snprintf(pad, sizeof(pad), "%-10s", txt);
+  tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(96, 20 + idx * 10); tft.print(pad);
+}
+
+void updateDisplay() {
+  if (!layoutDrawn) drawLayout();
+
+  // Wi-Fi dot in header
+  int w = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
+  if (w != lastWifiDot) { lastWifiDot = w; tft.fillCircle(126, 7, 3, w ? C_GREEN : C_RED); }
+
+  char b[24];
+  if (displayPage == 0) {
+    int vy0 = ROW_Y0 + 16, vy1 = ROW_Y0 + ROW_STEP + 16, vy2 = ROW_Y0 + 2 * ROW_STEP + 16;
+    if (sensorFailed) {
+      cell(0, 5, vy0, "--", C_WHITE, 12);  cell(1, 85, vy0, "--", C_WHITE, 12);
+      cell(2, 5, vy1, "--", C_WHITE, 12);  cell(3, 85, vy1, "--", C_WHITE, 12);
+    } else {
+      snprintf(b, sizeof(b), "%.1f V", readings.v);   cell(0, 5, vy0, b, C_WHITE, 12);
+      snprintf(b, sizeof(b), "%.3f A", readings.i);   cell(1, 85, vy0, b, C_WHITE, 12);
+      snprintf(b, sizeof(b), "%.1f W", readings.p);   cell(2, 5, vy1, b, C_WHITE, 12);
+      snprintf(b, sizeof(b), "%.2f kWh", readings.e); cell(3, 85, vy1, b, C_WHITE, 12);
+    }
+    snprintf(b, sizeof(b), "%.2f", balance);
+    if (strcmp(cellCache[4], b) != 0) {
+      strncpy(cellCache[4], b, 15); cellCache[4][15] = 0;
+      uint16_t bc = (balance <= minBalance) ? C_RED : (balance <= lowBal ? C_YELLOW : C_GREEN);
+      drawNaira(5, vy2, bc, C_DARK);
+      char pad[24]; snprintf(pad, sizeof(pad), "%-10s", b);
+      tft.setTextColor(C_WHITE, C_DARK); tft.setCursor(14, vy2); tft.print(pad);
+    }
+    int s = statusId();
+    cell(5, 85, vy2, STATUS_NAME[s], STATUS_COLOR[s], 12);
+  } else {
+    snprintf(b, sizeof(b), "NGN %.2f", tariff);              limit(0, b);
+    snprintf(b, sizeof(b), "%.1f kWh", tariff > 0 ? balance / tariff : 0);   limit(1, b);
+    if (timeValid()) snprintf(b, sizeof(b), "%.3f kWh", todayKwh); else snprintf(b, sizeof(b), "no time");
+    limit(2, b);
+    snprintf(b, sizeof(b), "%.0fHz %.2f", readings.f, readings.pf);          limit(3, b);
+    snprintf(b, sizeof(b), "%.0f V", overV);                 limit(4, b);
+    snprintf(b, sizeof(b), "%.0f V", underV);                limit(5, b);
+    snprintf(b, sizeof(b), "%.1f A", overI);                 limit(6, b);
+    snprintf(b, sizeof(b), "%.3f A", theftI);                limit(7, b);
+    snprintf(b, sizeof(b), "NGN %.0f", minBalance);          limit(8, b);
+  }
+}
+
+void splash() {
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, 54, 5, C_GREEN); tft.fillRect(54, 0, 52, 5, C_WHITE); tft.fillRect(106, 0, 54, 5, C_GREEN);
+  tft.setTextSize(2); tft.setTextColor(C_GREEN); tft.setCursor(8, 22); tft.print("SMART ENERGY");
+  tft.setTextSize(1); tft.setTextColor(C_WHITE); tft.setCursor(8, 48); tft.print("Management System");
+  tft.drawRect(8, 62, 144, 8, C_WHITE);
+  for (int i = 0; i < 140; i += 7) { tft.fillRect(10, 64, i, 4, C_BLUE); delay(25); }
+}
+
+// ============================== BUTTON ======================================
+void handleButton() {
+  static bool lastRaw = HIGH, stable = HIGH, longDone = false;
+  static unsigned long lastChange = 0, pressStart = 0;
+  bool raw = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+  if (raw != lastRaw) { lastChange = now; lastRaw = raw; }
+  if (now - lastChange > DEBOUNCE_MS && raw != stable) {
+    stable = raw;
+    if (stable == LOW) { pressStart = now; longDone = false; }
+    else if (!longDone) { displayPage ^= 1; layoutDrawn = false; }       // short press: change page
+  }
+  if (stable == LOW && !longDone && now - pressStart >= LONG_PRESS_MS) {  // long press: toggle power
+    longDone = true;
+    userPower(!relayState);
+    if (!relayState && !manualOff) { const char* why = offReason(); if (why) notify(why, C_YELLOW); }
+  }
+}
+
+// ============================== WI-FI =======================================
+void startAP() {
+  if (apActive) return;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  apActive = true;
+  Serial.printf("[WiFi] Fallback AP '%s' at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+}
+
+void stopAP() {
+  if (!apActive) return;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  apActive = false;
+}
+
+void refreshIp() {
+  String n; bool ap = false;
+  if (WiFi.status() == WL_CONNECTED) n = WiFi.localIP().toString();
+  else if (apActive) { n = WiFi.softAPIP().toString(); ap = true; }
+  if (n != ipStr || ap != ipIsAp) {
+    ipStr = n; ipIsAp = ap;
+    if (uiReady && !notifActive) drawFooter();
+  }
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  tft.fillRect(0, 76, 160, 40, C_BLACK);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE, C_BLACK);
+  tft.setCursor(8, 78); tft.print("Connecting WiFi...");
+  unsigned long start = millis(); int x = 8;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_BOOT_TIMEOUT) {
+    delay(500);
+    tft.setCursor(x, 92); tft.print("."); x += 6; if (x > 150) x = 8;
+  }
+  tft.fillRect(0, 76, 160, 40, C_BLACK);
+  tft.setCursor(8, 78);
+  if (WiFi.status() == WL_CONNECTED) {
+    lastConnectedMs = millis();
+    tft.setTextColor(C_GREEN, C_BLACK); tft.print("WiFi connected");
+    tft.setCursor(8, 92); tft.setTextColor(C_WHITE, C_BLACK); tft.print(WiFi.localIP().toString());
+    Serial.printf("[WiFi] Connected, IP %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    tft.setTextColor(C_RED, C_BLACK); tft.print("WiFi failed");
+    tft.setCursor(8, 92); tft.setTextColor(C_YELLOW, C_BLACK); tft.print("Starting setup AP");
+    startAP();
+  }
+  delay(1200);
+}
+
+void maintainWiFi() {
+  static unsigned long last = 0, connectedSince = 0, lastRetry = 0;
+  unsigned long now = millis();
+  if (now - last < 2000) return;
+  last = now;
+  if (WiFi.status() == WL_CONNECTED) {
+    lastConnectedMs = now;
+    if (!connectedSince) { connectedSince = now; notify("WiFi connected", C_GREEN); }
+    if (!mdnsStarted && MDNS.begin(HOSTNAME)) { MDNS.addService("http", "tcp", 80); mdnsStarted = true; }
+    if (apActive && now - connectedSince > 30000) stopAP();
+  } else {
+    if (connectedSince) { connectedSince = 0; notify("WiFi lost", C_YELLOW); }
+    if (!apActive && now - lastConnectedMs > 20000) startAP();
+    if (now - lastRetry > 15000) { lastRetry = now; WiFi.reconnect(); }
+  }
+  refreshIp();
+}
+
+// ============================== AUTH ========================================
+void newSession() {
+  char buf[33];
+  snprintf(buf, sizeof(buf), "%08X%08X%08X%08X", esp_random(), esp_random(), esp_random(), esp_random());
+  sessionToken = buf; lastActivity = millis();
+}
+
+bool isAuthed() {
+  if (sessionToken.length() != 32) return false;
+  if (millis() - lastActivity > SESSION_MS) { sessionToken = ""; return false; }
+  String c = server.header("Cookie");
+  int p = c.indexOf("ESPSESSID=");
+  if (p < 0) return false;
+  if (c.substring(p + 10, p + 42) == sessionToken) { lastActivity = millis(); return true; }
+  return false;
+}
+
+void redirectTo(const char* url) {
+  server.sendHeader("Location", url);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(303, "text/plain", "");
+}
+
+void sendJson(int code, const char* body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(code, "application/json", body);
+}
+
+void sendMsg(bool ok, const char* msg) {
+  char b[200];
+  snprintf(b, sizeof(b), "{\"success\":%s,\"message\":\"%s\"}", ok ? "true" : "false", msg);
+  sendJson(200, b);
+}
+
+bool requireApi() {
+  if (isAuthed()) return true;
+  sendJson(401, "{\"success\":false,\"message\":\"Session expired\"}");
+  return false;
+}
+
+bool argF(const char* name, float& out) {
+  if (!server.hasArg(name)) return false;
+  String s = server.arg(name); s.trim();
+  if (!s.length()) return false;
+  char* end; out = strtof(s.c_str(), &end);
+  return end != s.c_str() && isfinite(out);
+}
+
+// ============================== WEB HANDLERS ================================
+void handleRoot() {
+  if (!isAuthed()) { redirectTo("/login"); return; }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleLoginGet() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", LOGIN_HTML);
+}
+
+void handleLoginPost() {
+  unsigned long now = millis();
+  if (now < lockUntil) { redirectTo("/login?locked=1"); return; }
+  if (server.arg("username") == ADMIN_USER && server.arg("password") == adminPw) {
+    failCount = 0;
+    newSession();
+    server.sendHeader("Set-Cookie", "ESPSESSID=" + sessionToken + "; Path=/; HttpOnly; SameSite=Strict");
+    redirectTo("/");
+  } else {
+    if (++failCount >= 5) { lockUntil = now + 60000UL; failCount = 0; }
+    delay(500);
+    redirectTo("/login?error=1");
+  }
+}
+
+void handleLogout() {
+  sessionToken = "";
+  server.sendHeader("Set-Cookie", "ESPSESSID=; Path=/; Max-Age=0");
+  redirectTo("/login");
+}
+
+void handleData() {
+  if (!requireApi()) return;
+  unsigned long now = millis();
+  float units = tariff > 0 ? (float)(balance / tariff) : 0;
+  float hrs = -1;
+  if (readings.p > 20 && tariff > 0) hrs = (float)(balance / ((readings.p / 1000.0f) * tariff));
+  int restore = 0;
+  if (supplyStableSince != 0 && !supplyReady())
+    restore = (int)(((unsigned long)(restoreSec * 1000.0f) - (now - supplyStableSince)) / 1000UL) + 1;
+  int sid = statusId();
+  char b[1024];
+  snprintf(b, sizeof(b),
+    "{\"v\":%.1f,\"i\":%.3f,\"p\":%.1f,\"e\":%.3f,\"f\":%.1f,\"pf\":%.2f,"
+    "\"bal\":%.2f,\"units\":%.2f,\"st\":\"%s\",\"fault\":\"%s\",\"relay\":%s,\"manual\":%s,\"theft\":%s,"
+    "\"today\":%.3f,\"todayN\":%.2f,\"todayOk\":%s,\"hrs\":%.1f,\"restore\":%d,"
+    "\"tariff\":%.2f,\"minBal\":%.2f,\"lowBal\":%.2f,\"overV\":%.0f,\"underV\":%.0f,\"overI\":%.1f,\"theftI\":%.3f,\"rdelay\":%.0f,"
+    "\"rssi\":%d,\"ip\":\"%s\",\"ap\":%s,\"defpw\":%s,\"up\":%lu}",
+    readings.v, readings.i, readings.p, readings.e, readings.f, readings.pf,
+    balance, units, STATUS_NAME[sid], faultText(), relayState ? "true" : "false", manualOff ? "true" : "false",
+    theftDetected ? "true" : "false",
+    todayKwh, todayKwh * tariff, timeValid() ? "true" : "false", hrs, restore,
+    tariff, minBalance, lowBal, overV, underV, overI, theftI, restoreSec,
+    WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0, ipStr.c_str(), apActive ? "true" : "false",
+    (adminPw == DEFAULT_PASSWORD) ? "true" : "false", now / 1000UL);
+  sendJson(200, b);
+}
+
+void handleHistory() {
+  if (!requireApi()) return;
+  String s = "[";
+  bool first = true;
+  for (int i = 0; i < TX_MAX; i++) {
+    if (txLog[i].a <= 0) continue;
+    if (!first) s += ",";
+    first = false;
+    char e[48]; snprintf(e, sizeof(e), "{\"t\":%lu,\"a\":%.2f}", (unsigned long)txLog[i].t, txLog[i].a);
+    s += e;
+  }
+  s += "]";
+  sendJson(200, s.c_str());
+}
+
+void handleRecharge() {
+  if (!requireApi()) return;
+  float a;
+  if (!argF("amount", a) || a < MIN_RECHARGE || a > MAX_RECHARGE) { sendMsg(false, "Enter an amount between 100 and 500000"); return; }
+  a = roundf(a * 100.0f) / 100.0f;
+  balance += a;
+  addTx(a);
+  maybeSave(true);
+  lowNotified = false;
+  evaluateRelay();
+  char n[28]; snprintf(n, sizeof(n), "Recharged NGN %.0f", a);
+  notify(n, C_GREEN);
+  char b[160];
+  snprintf(b, sizeof(b), "{\"success\":true,\"message\":\"Recharge successful\",\"balance\":%.2f}", balance);
+  sendJson(200, b);
+}
+
+void handleSetRelay() {
+  if (!requireApi()) return;
+  if (!server.hasArg("state")) { sendMsg(false, "Missing state"); return; }
+  int st = server.arg("state").toInt();
+  if (st == 0) { userPower(false); sendMsg(true, "Power switched OFF"); return; }
+  userPower(true);
+  if (relayState) { sendMsg(true, "Power is ON"); return; }
+  const char* why = offReason();
+  if (!why || strstr(why, "stabilise")) sendMsg(true, "Command accepted. Power returns shortly");
+  else sendMsg(false, why);
+}
+
+void handleSettings() {
+  if (!requireApi()) return;
+  float oV, uV, oI, tI, mB, lB, tar, rdl;
+  if (!argF("overV", oV) || !argF("underV", uV) || !argF("overI", oI) || !argF("theftI", tI) ||
+      !argF("minBal", mB) || !argF("lowBal", lB) || !argF("tariff", tar) || !argF("rdelay", rdl)) {
+    sendMsg(false, "Fill in every field with a valid number"); return;
+  }
+  const char* err = validateLimits(oV, uV, oI, tI, mB, lB, tar, rdl);
+  if (err) { sendMsg(false, err); return; }
+  overV = oV; underV = uV; overI = oI; theftI = tI; minBalance = mB; lowBal = lB; tariff = tar; restoreSec = rdl;
+  saveSettings();
+  invalidateCaches();
+  notify("Settings updated", C_GREEN);
+  sendMsg(true, "Settings saved");
+}
+
+void handlePassword() {
+  if (!requireApi()) return;
+  String o = server.arg("oldPw"), n = server.arg("newPw");
+  if (o != adminPw) { sendMsg(false, "Current password is wrong"); return; }
+  if (n.length() < 6 || n.length() > 32) { sendMsg(false, "New password must be 6-32 characters"); return; }
+  if (n == DEFAULT_PASSWORD) { sendMsg(false, "Choose a different password"); return; }
+  adminPw = n;
+  prefs.putString("pw", adminPw);
+  sendMsg(true, "Password changed");
+}
+
+void handleFactoryReset() {
+  if (!requireApi()) return;
+  if (server.arg("pw") != adminPw) { sendMsg(false, "Wrong password"); return; }
+  sendMsg(true, "Resetting. Meter is restarting");
+  notify("Factory reset...", C_YELLOW, 3000);
+  delay(500);
+  prefs.clear();
+  delay(200);
+  ESP.restart();
+}
+
+void handleNotFound() { server.send(404, "text/plain", "404: Not found"); }
+
+// ============================== SETUP / LOOP ================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // Relay first, and OFF: the meter only closes it after credit and supply are verified.
+  pinMode(RELAY_PIN, OUTPUT);
+  driveRelay(false);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  prefs.begin("meter", false);
+  loadSettings();
+
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1);
+  tft.setTextWrap(false);
+  splash();
+
+  sensorFailSince = millis();
+  connectWiFi();
+  configTime(3600, 0, "pool.ntp.org", "time.google.com");   // WAT = UTC+1, no DST
+  refreshIp();
+
+  const char* hdrs[] = {"Cookie"};
+  server.collectHeaders(hdrs, 1);
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/login", HTTP_GET, handleLoginGet);
+  server.on("/login", HTTP_POST, handleLoginPost);
+  server.on("/logout", HTTP_GET, handleLogout);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/history", HTTP_GET, handleHistory);
+  server.on("/recharge", HTTP_POST, handleRecharge);
+  server.on("/setRelay", HTTP_POST, handleSetRelay);
+  server.on("/settings", HTTP_POST, handleSettings);
+  server.on("/password", HTTP_POST, handlePassword);
+  server.on("/factoryReset", HTTP_POST, handleFactoryReset);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  drawLayout();
+  notify("System ready", C_GREEN, 3000);
+}
+
+void loop() {
+  static unsigned long lastRead = 0, lastDraw = 0, lastReminder = 0;
+  server.handleClient();
+  unsigned long now = millis();
+
+  if (now - lastRead >= READ_INTERVAL) {
+    lastRead = now;
+    readPzem();
+    billing();
+    updateDay();
+    updateProtection();
+    evaluateRelay();
+    maybeSave(false);
+  }
+
+  handleButton();
+  maintainWiFi();
+
+  if (notifActive && now >= notifEnd) { notifActive = false; if (uiReady) drawFooter(); }
+
+  if (now - lastReminder >= REMINDER_INTERVAL) {
+    lastReminder = now;
+    int s = statusId();
+    if (s == S_SENSOR)        notify("PZEM disconnected!", C_RED);
+    else if (s == S_FAULT)    notify("Fault active! Check", C_RED);
+    else if (s == S_THEFT)    notify("Theft alert active!", C_RED);
+    else if (s == S_NOCREDIT) notify("No credit. Recharge", C_YELLOW);
+    else if (s == S_LOW)      notify("Low credit! Recharge", C_YELLOW);
+  }
+
+  if (now - lastDraw >= DISPLAY_INTERVAL) { lastDraw = now; updateDisplay(); }
+}
